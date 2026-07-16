@@ -14,7 +14,7 @@ class Config:
     # PING_URL  : your public Render URL, e.g. https://my-bot.onrender.com
     #             Leave empty to disable the self-ping (not recommended on free tier)
     PORT     = int(environ.get("PORT", 8080))
-    PING_URL = environ.get("PING_URL", "")
+    PING_URL = environ.get("PING_URL", "https://fowardprobot.onrender.com")
 
 class temp(object): 
     lock = {}
