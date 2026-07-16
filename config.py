@@ -22,3 +22,4 @@ class temp(object):
     forwardings = 0
     BANNED_USERS = []
     IS_FRWD_CHAT = []
+    ALLOW_MODE = None   # None = not yet loaded; True/False = cached from DB
