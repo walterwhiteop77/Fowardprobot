@@ -1,178 +1,250 @@
 """
 Auto-Forward Engine
 ───────────────────
-Listens to every channel message the bot receives.
-If the channel is a registered source, buffers messages for BUFFER_DELAY
-seconds (to catch media groups), then copies them to every mapped target.
+Two forwarding paths share one async queue:
+
+  BOT path     — handles source channels where the main bot is admin.
+                 Active only for users who have NOT set up a userbot.
+
+  USERBOT path — one Pyrogram Client per user who has a stored userbot
+                 session.  Handles ALL source channels for that user,
+                 including private ones the bot cannot read.
+
+Rate limiting is fully delegated to plugins/rate_limiter.py:
+  • Per-channel token bucket   (max 12 msgs/min per target channel)
+  • Per-client global bucket   (max 15 msgs/s for bot, 4/s for userbot)
+  • Circuit-breaker per target (pauses a broken target for 10 min)
+  • FloodWait drain            (respects exact Telegram wait + jitter)
+  • PeerFlood cooldown         (1-hour freeze when account is flagged)
 """
 
 import asyncio
 import logging
 from collections import defaultdict
+from typing import Dict, List, Tuple
+
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.handlers import MessageHandler
+
+from config import Config
 from database import db
+from plugins.rate_limiter import safe_copy_message
 
 logger = logging.getLogger(__name__)
 
-BUFFER_DELAY = 4          # seconds to wait before flushing a buffer batch
+# ── Media filter ──────────────────────────────────────────────────────────────
+_MEDIA = (
+    filters.video
+    | filters.document
+    | filters.photo
+    | filters.audio
+    | filters.voice
+)
 
-# ── Per-source message buffers & pending tasks ────────────────────────────────
-message_buffer: dict = defaultdict(list)
-buffer_tasks:   dict = {}
+# ── Running userbot clients  {user_id → Client} ───────────────────────────────
+# Exposed so autoforward.py and main.py can read it.
+_running_userbots: Dict[int, Client] = {}
 
-# ── Single async queue consumed by one worker per bot session ─────────────────
-forward_queue = asyncio.Queue()
-_processor_started = False
+# ── Message buffer  {source_chat_id → [(Message, [target_ids], Client)]} ──────
+_buffers: Dict[int, List[Tuple]] = defaultdict(list)
+_flush_tasks: Dict[int, asyncio.Task] = {}
+
+BUFFER_DELAY = 4   # seconds — lets media-group frames arrive before forwarding
+
+# ── Forward queue  items: ([Message], [int target_ids], Client, bool is_ub) ───
+_queue: asyncio.Queue = asyncio.Queue()
+_queue_running = False
 
 
-# ─── Queue worker ─────────────────────────────────────────────────────────────
+# ── Queue worker ──────────────────────────────────────────────────────────────
 
-async def _queue_worker(client):
-    """Consume (messages, target_ids) tuples and forward one-by-one."""
+async def _queue_worker():
+    """
+    Consume forwarding jobs one by one.
+    Each job: (messages, target_ids, copy_client, is_userbot).
+    Calls safe_copy_message() for every (message, target) pair.
+    safe_copy_message handles all FloodWait / rate-limiting internally.
+    """
     while True:
         try:
-            messages, target_ids = await forward_queue.get()
+            messages, target_ids, copy_client, is_ub = await _queue.get()
 
-            sorted_msgs = sorted(messages, key=lambda m: m.id)
+            for msg in sorted(messages, key=lambda m: m.id):
+                for tid in target_ids:
+                    await safe_copy_message(
+                        copy_client,
+                        chat_id      = tid,
+                        from_chat_id = msg.chat.id,
+                        message_id   = msg.id,
+                        caption          = msg.caption,
+                        caption_entities = msg.caption_entities if msg.caption else None,
+                        is_userbot   = is_ub,
+                    )
 
-            for target_id in target_ids:
-                for msg in sorted_msgs:
-                    await _copy_with_retry(client, msg, target_id)
-                    await asyncio.sleep(0.3)          # small gap between files
-                await asyncio.sleep(0.5)              # gap between targets
-
-            forward_queue.task_done()
+            _queue.task_done()
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"[af_engine] queue worker error: {e}")
+            logger.error(f"[af_engine] queue worker error: {e}", exc_info=True)
             await asyncio.sleep(1)
 
 
-async def _copy_with_retry(client, message, target_id, retries=3):
-    for attempt in range(retries):
-        try:
-            kwargs = {
-                "chat_id":     target_id,
-                "from_chat_id": message.chat.id,
-                "message_id":  message.id,
-            }
-            if message.caption:
-                kwargs["caption"] = message.caption
-                if message.caption_entities:
-                    kwargs["caption_entities"] = message.caption_entities
+# ── Buffer helpers ────────────────────────────────────────────────────────────
 
-            await client.copy_message(**kwargs)
-            logger.info(
-                f"[af_engine] copied msg {message.id} "
-                f"from {message.chat.id} → {target_id}"
-            )
-            return
-
-        except FloodWait as e:
-            logger.warning(f"[af_engine] FloodWait {e.value}s → {target_id}")
-            await asyncio.sleep(e.value + 1)
-
-        except RPCError as e:
-            logger.error(f"[af_engine] RPCError → {target_id}: {e}")
-            if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
-            else:
-                logger.error(f"[af_engine] giving up on msg {message.id} → {target_id}")
-
-        except Exception as e:
-            logger.error(f"[af_engine] unexpected error → {target_id}: {e}")
-            return
-
-
-# ─── Buffer flusher ───────────────────────────────────────────────────────────
-
-async def _flush_buffer(source_chat_id, client):
-    """Called after BUFFER_DELAY; looks up targets and enqueues the batch."""
+async def _flush(source_id: int):
+    """Wait BUFFER_DELAY, then push the accumulated batch onto the queue."""
     await asyncio.sleep(BUFFER_DELAY)
 
-    messages = message_buffer.pop(source_chat_id, [])
-    buffer_tasks.pop(source_chat_id, None)
-
-    if not messages:
+    items = _buffers.pop(source_id, [])
+    _flush_tasks.pop(source_id, None)
+    if not items:
         return
 
-    try:
-        mappings = await db.get_af_all_targets_for_source(source_chat_id)
-        if not mappings:
-            return
+    # Group items that share the same (frozenset of targets, client identity)
+    # so we don't send the same message to the same target twice.
+    groups: dict = {}
+    for msg, target_ids, copy_client, is_ub in items:
+        key = (frozenset(target_ids), id(copy_client))
+        if key not in groups:
+            groups[key] = ([], list(target_ids), copy_client, is_ub)
+        groups[key][0].append(msg)
 
-        # Collect unique target IDs across all users who monitor this source
-        all_targets = []
-        seen = set()
-        for mapping in mappings:
-            for t in mapping.get("target_ids", []):
-                t_id = t["id"]
-                if t_id not in seen:
-                    seen.add(t_id)
-                    all_targets.append(t_id)
-
-        if all_targets:
-            await forward_queue.put((messages.copy(), all_targets))
-            logger.info(
-                f"[af_engine] queued {len(messages)} msg(s) "
-                f"from {source_chat_id} → {len(all_targets)} target(s)"
-            )
-
-    except Exception as e:
-        logger.error(f"[af_engine] flush error for {source_chat_id}: {e}")
+    for msgs, tids, cli, is_ub in groups.values():
+        await _queue.put((msgs, tids, cli, is_ub))
+        logger.info(
+            f"[af_engine] queued {len(msgs)} msg(s) "
+            f"from {source_id} → {len(tids)} target(s)"
+        )
 
 
-# ─── Public startup helper ────────────────────────────────────────────────────
+def _add_to_buffer(
+    source_id:   int,
+    message,
+    target_ids:  List[int],
+    copy_client: Client,
+    is_userbot:  bool,
+):
+    _buffers[source_id].append((message, target_ids, copy_client, is_userbot))
+    # Reset the flush timer so the whole batch waits together
+    if source_id in _flush_tasks:
+        _flush_tasks[source_id].cancel()
+    _flush_tasks[source_id] = asyncio.create_task(_flush(source_id))
 
-async def start_af_queue(client):
-    """Call once after bot.start() to launch the queue worker."""
-    global _processor_started
-    if _processor_started:
+
+# ── Startup helpers ───────────────────────────────────────────────────────────
+
+async def start_af_queue(bot_client: Client):
+    """Start the queue worker. Call once after bot.start()."""
+    global _queue_running
+    if _queue_running:
         return
-    _processor_started = True
-    asyncio.create_task(_queue_worker(client))
-    logger.info("[af_engine] auto-forward queue worker started")
+    _queue_running = True
+    asyncio.create_task(_queue_worker())
+    logger.info("[af_engine] queue worker started")
 
 
-# ─── Pyrogram handler: fires on every channel message ─────────────────────────
+async def start_all_userbot_af():
+    """
+    Called at bot startup.
+    For every user who has an AF config with sources+targets AND a saved
+    userbot session, start one Pyrogram client to monitor their sources.
+    """
+    configs = await db.get_all_af_configs()
+    started = 0
+    for cfg in configs:
+        uid = cfg.get("user_id")
+        if not cfg.get("sources") or not cfg.get("targets"):
+            continue
+        ub_data = await db.get_userbot(uid)
+        if not ub_data or not ub_data.get("session"):
+            continue
+        try:
+            await start_userbot_af(uid, ub_data["session"])
+            started += 1
+        except Exception as e:
+            logger.error(f"[af_engine] Could not start userbot for user {uid}: {e}")
+    logger.info(f"[af_engine] {started} userbot AF client(s) started at boot")
 
-@Client.on_message(
-    filters.channel
-    & (
-        filters.video
-        | filters.document
-        | filters.photo
-        | filters.audio
-        | filters.voice
+
+async def start_userbot_af(user_id: int, session_string: str) -> None:
+    """
+    Start (or restart) the userbot Pyrogram client for user_id.
+    The client registers its own MessageHandler for channel media.
+    """
+    await stop_userbot_af(user_id)   # tear down old client if running
+
+    ub = Client(
+        f"af_ub_{user_id}",
+        api_id       = Config.API_ID,
+        api_hash     = Config.API_HASH,
+        session_string = session_string,
+        in_memory    = True,
     )
-)
-async def auto_forward_handler(client, message):
-    """
-    Triggered whenever the bot sees a media message in a channel it belongs to.
-    We do a quick DB check to see if this channel is a tracked source before
-    buffering anything.
-    """
+
+    async def _handler(ub_client: Client, message):
+        try:
+            source_id = message.chat.id
+            cfg = await db.get_af_config(user_id)
+            if not any(s["id"] == source_id for s in cfg.get("sources", [])):
+                return
+            target_ids = [t["id"] for t in cfg.get("targets", [])]
+            if not target_ids:
+                return
+            _add_to_buffer(source_id, message, target_ids, ub_client, is_userbot=True)
+        except Exception as e:
+            logger.error(f"[af_engine] userbot handler error (uid {user_id}): {e}")
+
+    ub.add_handler(MessageHandler(_handler, filters.channel & _MEDIA))
+    await ub.start()
+    me = await ub.get_me()
+    _running_userbots[user_id] = ub
+    logger.info(
+        f"[af_engine] userbot AF ready — user {user_id}, "
+        f"account @{me.username or me.id}"
+    )
+
+
+async def stop_userbot_af(user_id: int) -> None:
+    """Stop and remove the userbot client for user_id (if running)."""
+    ub = _running_userbots.pop(user_id, None)
+    if ub:
+        try:
+            await ub.stop()
+        except Exception:
+            pass
+        logger.info(f"[af_engine] userbot AF stopped — user {user_id}")
+
+
+# ── Bot-side channel handler ──────────────────────────────────────────────────
+# Only forwards for users whose userbot is NOT running — avoids duplication.
+
+@Client.on_message(filters.channel & _MEDIA)
+async def _bot_channel_handler(bot_client: Client, message):
     try:
         source_id = message.chat.id
 
-        # Fast path: is this channel tracked by anyone?
-        mappings = await db.get_af_all_targets_for_source(source_id)
-        if not mappings:
+        # get_source_users → [(user_id, [target_ids]), ...]
+        user_targets = await db.get_source_users(source_id)
+        if not user_targets:
             return
 
-        # Buffer the message
-        message_buffer[source_id].append(message)
+        # Collect targets only from users whose userbot is NOT running
+        bot_targets: List[int] = []
+        seen: set = set()
+        for uid, tids in user_targets:
+            if uid in _running_userbots:
+                continue     # userbot handles this user's targets
+            for tid in tids:
+                if tid not in seen:
+                    seen.add(tid)
+                    bot_targets.append(tid)
 
-        # Reset (or start) the flush timer
-        if source_id in buffer_tasks:
-            buffer_tasks[source_id].cancel()
-
-        buffer_tasks[source_id] = asyncio.create_task(
-            _flush_buffer(source_id, client)
-        )
+        if bot_targets:
+            _add_to_buffer(
+                source_id, message, bot_targets,
+                bot_client, is_userbot=False
+            )
 
     except Exception as e:
-        logger.error(f"[af_engine] handler error: {e}", exc_info=True)
+        logger.error(f"[af_engine] bot handler error: {e}", exc_info=True)
