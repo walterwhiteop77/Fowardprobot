@@ -8,9 +8,4 @@ pymongo
 umongo
 psutil
 pytz
-
-Flask
-gunicorn
-Jinja2
-werkzeug
-itsdangerous
+aiohttp

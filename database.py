@@ -10,7 +10,12 @@ class Db:
         self.userbot = self.db.userbot 
         self.col = self.db.users
         self.nfy = self.db.notify
-        self.chl = self.db.channels 
+        self.chl = self.db.channels
+        # ── Auto-forward mappings ──────────────────────────────────────────
+        self.af  = self.db.af_mappings   # { user_id, source_id, source_title,
+                                         #   target_ids: [{id, title}] }
+
+    # ── User helpers ──────────────────────────────────────────────────────────
 
     def new_user(self, id, name):
         return dict(
@@ -106,6 +111,8 @@ class Db:
             return user.get('configs', default)
         return default 
 
+    # ── Bot / Userbot helpers ─────────────────────────────────────────────────
+
     async def add_bot(self, datas):
        if not await self.is_bot_exist(datas['user_id']):
           await self.bot.insert_one(datas)
@@ -135,7 +142,9 @@ class Db:
     async def is_userbot_exist(self, user_id):
        bot = await self.userbot.find_one({'user_id': user_id})
        return bool(bot)
-    
+
+    # ── Channel helpers ───────────────────────────────────────────────────────
+
     async def in_channel(self, user_id: int, chat_id: int) -> bool:
        channel = await self.chl.find_one({"user_id": int(user_id), "chat_id": int(chat_id)})
        return bool(channel)
@@ -166,6 +175,8 @@ class Db:
           if v == False:
             filters.append(str(k))
        return filters
+
+    # ── Forward-task helpers ──────────────────────────────────────────────────
 
     async def add_frwd(self, user_id):
        return await self.nfy.insert_one({'user_id': int(user_id)})
@@ -209,5 +220,95 @@ class Db:
    
     async def update_forward(self, user_id, details):
         await self.nfy.update_one({'user_id': user_id}, {'$set': {'details': details}})
-        
+
+    # ── Auto-Forward Mapping helpers ──────────────────────────────────────────
+    #
+    # Schema stored in `af_mappings` collection:
+    # {
+    #   "user_id":      int,           # Telegram user who created this rule
+    #   "source_id":    int,           # Source channel chat_id
+    #   "source_title": str,
+    #   "target_ids":   [              # List of target channels
+    #     { "id": int, "title": str },
+    #     ...
+    #   ]
+    # }
+
+    async def get_af_mappings(self, user_id: int):
+        """Return all af mappings for a given user."""
+        cursor = self.af.find({"user_id": int(user_id)})
+        return await cursor.to_list(length=None)
+
+    async def get_af_mapping_by_source(self, user_id: int, source_id: int):
+        """Return the mapping doc for a specific user+source pair."""
+        return await self.af.find_one({
+            "user_id":   int(user_id),
+            "source_id": int(source_id),
+        })
+
+    async def add_af_target(
+        self,
+        user_id:      int,
+        source_id:    int,
+        source_title: str,
+        target_id:    int,
+        target_title: str,
+    ) -> str:
+        """
+        Link target_id to source_id for user_id.
+        Returns "created" | "added" | "exists".
+        """
+        existing = await self.af.find_one({
+            "user_id":   int(user_id),
+            "source_id": int(source_id),
+        })
+
+        target_entry = {"id": int(target_id), "title": target_title}
+
+        if existing:
+            # Check if target already present
+            for t in existing.get("target_ids", []):
+                if t["id"] == int(target_id):
+                    return "exists"
+            # Append new target
+            await self.af.update_one(
+                {"user_id": int(user_id), "source_id": int(source_id)},
+                {
+                    "$push": {"target_ids": target_entry},
+                    "$set":  {"source_title": source_title},
+                },
+            )
+            return "added"
+        else:
+            await self.af.insert_one({
+                "user_id":      int(user_id),
+                "source_id":    int(source_id),
+                "source_title": source_title,
+                "target_ids":   [target_entry],
+            })
+            return "created"
+
+    async def remove_af_target(self, user_id: int, source_id: int, target_id: int):
+        """Remove a single target from a source mapping."""
+        await self.af.update_one(
+            {"user_id": int(user_id), "source_id": int(source_id)},
+            {"$pull": {"target_ids": {"id": int(target_id)}}},
+        )
+
+    async def remove_af_source(self, user_id: int, source_id: int):
+        """Delete the entire source mapping (all its targets)."""
+        await self.af.delete_one({
+            "user_id":   int(user_id),
+            "source_id": int(source_id),
+        })
+
+    async def get_af_all_targets_for_source(self, source_id: int):
+        """
+        Return all mapping docs that watch source_id — across ALL users.
+        Used by the auto-forward engine to decide where to send a new message.
+        """
+        cursor = self.af.find({"source_id": int(source_id)})
+        return await cursor.to_list(length=None)
+
+
 db = Db(Config.DATABASE_URI, Config.DATABASE_NAME)

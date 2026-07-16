@@ -12,18 +12,21 @@ class  Script(object):
 
 <u>**📚 Available commands:**</u>
 <b>⏣ __/start - check I'm alive__ 
-⏣ __/forward - forward messages__
+⏣ __/forward - bulk forward messages from one channel to another__
+⏣ __/autoforward - manage auto-forward channel mappings__
 ⏣ __/settings - configure your settings__
 ⏣ __ /unequify - delete duplicate media messages in chats__
 ⏣ __ /stop - stop your ongoing tasks__
 ⏣ __ /reset - reset your settings__</b>
 
 <b><u>💢 Features:</b></u>
-<b>► __Forward message from public channel to your channel without admin permission. if the channel is private need admin permission, if you can't give admin permission then use userbot, but in userbot there is a chance to get your account ban so use fake account__
-► __custom caption__
-► __custom button__
-► __skip duplicate messages__
-► __filter type of messages__</b>
+<b>► __Bulk forward messages from any channel to your channel__
+► __Auto forward — files posted in source channels are instantly forwarded to target channels__
+► __Multiple source channels → multiple target channels__
+► __Custom caption__
+► __Custom button__
+► __Skip duplicate messages__
+► __Filter type of messages__</b>
 """
   
   HOW_USE_TXT = """<b><u>⚠️ Before Forwarding:</b></u>
@@ -31,7 +34,14 @@ class  Script(object):
 ► __add atleast one to channel__ `(your bot must be admin in there)`
 ► __You can add chats or bots by using /settings__
 ► __if the **From Channel** is private your userbot must be member in there or your bot must need admin permission in there also__
-► __Then use /forward to forward messages__ </b>"""
+► __Then use /forward to forward messages__ </b>
+
+<b><u>🔄 Auto Forward:</b></u>
+<b>► __Use /autoforward to open the auto-forward manager__
+► __Tap ➕ Add Mapping__
+► __Forward a message from your source channel__
+► __Forward a message from your target channel__
+► __Files are now auto-forwarded instantly when posted!__</b>"""
   
   ABOUT_TXT = """<b>
 ╔════❰ ғᴏʀᴡᴀʀᴅ ʙᴏᴛ ❱═❍⊱❁۪۪
@@ -42,7 +52,7 @@ class  Script(object):
 ║┣⪼📡Hᴏsᴛᴇᴅ ᴏɴ : Sᴜᴘᴇʀ Fᴀsᴛ
 ║┣⪼🗣️Lᴀɴɢᴜᴀɢᴇ : Pʏᴛʜᴏɴ3
 ║┣⪼📚Lɪʙʀᴀʀʏ : Pʏʀᴏɢʀᴀᴍ Gᴀᴛʜᴇʀ 2.11.0 
-║┣⪼🗒️Vᴇʀsɪᴏɴ : 0.18.3
+║┣⪼🗒️Vᴇʀsɪᴏɴ : 0.19.0
 ║╰━━━━━━━━━━━━━━━➣
 ╚══════════════════❍⊱❁۪۪
 </b>"""
