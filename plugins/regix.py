@@ -15,11 +15,6 @@ from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message 
 from .db import connect_user_db
 from pyrogram.types import Message
-from plugins.rate_limiter import (
-    safe_copy_message,
-    safe_forward_messages,
-    safe_send_cached_media,
-)
 
 CLIENT = CLIENT()
 logger = logging.getLogger(__name__)
@@ -174,53 +169,42 @@ async def pub_(bot, message):
 
 
 async def copy(user, bot, msg, m, sts, is_ub=False):
-    """
-    Copy a single message to the target channel.
-    All rate-limiting and error handling is inside safe_copy_message /
-    safe_send_cached_media — no recursion, no plain sleeps.
-    """
-    to_chat = sts.get('TO')
+    to_chat   = sts.get('TO')
     from_chat = sts.get('FROM')
-
-    if msg.get("media") and msg.get("caption"):
-        ok = await safe_send_cached_media(
-            bot,
-            chat_id         = to_chat,
-            file_id         = msg["media"],
-            caption         = msg.get("caption"),
-            reply_markup    = msg.get("button"),
-            protect_content = bool(msg.get("protect")),
-            is_userbot      = is_ub,
-        )
-    else:
-        ok = await safe_copy_message(
-            bot,
-            chat_id          = to_chat,
-            from_chat_id     = from_chat,
-            message_id       = msg["msg_id"],
-            caption          = msg.get("caption"),
-            reply_markup     = msg.get("button"),
-            protect_content  = bool(msg.get("protect")),
-            is_userbot       = is_ub,
-        )
-
-    if not ok:
+    try:
+        if msg.get("media") and msg.get("caption"):
+            await bot.send_cached_media(
+                chat_id         = to_chat,
+                file_id         = msg["media"],
+                caption         = msg.get("caption"),
+                reply_markup    = msg.get("button"),
+                protect_content = bool(msg.get("protect")),
+            )
+        else:
+            await bot.copy_message(
+                chat_id          = to_chat,
+                from_chat_id     = from_chat,
+                message_id       = msg["msg_id"],
+                caption          = msg.get("caption"),
+                reply_markup     = msg.get("button"),
+                protect_content  = bool(msg.get("protect")),
+            )
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+    except Exception:
         sts.add('deleted')
 
 
 async def forward(user, bot, msg, m, sts, protect, is_ub=False):
-    """
-    Forward a batch of messages (forward_tag mode).
-    Uses safe_forward_messages — loop-based retry, no recursion.
-    """
-    await safe_forward_messages(
-        bot,
-        chat_id         = sts.get('TO'),
-        from_chat_id    = sts.get('FROM'),
-        message_ids     = msg,
-        protect_content = protect,
-        is_userbot      = is_ub,
-    )
+    try:
+        await bot.forward_messages(
+            chat_id         = sts.get('TO'),
+            from_chat_id    = sts.get('FROM'),
+            message_ids     = msg,
+            protect_content = protect,
+        )
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
 
 
 async def msg_edit(msg, text, button=None, wait=None):
