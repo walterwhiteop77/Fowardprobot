@@ -1,41 +1,40 @@
 """
 Auto-Forward Engine
 ───────────────────
-Two forwarding paths share one async queue:
+Two forwarding paths:
 
   BOT path     — handles source channels where the main bot is admin.
-                 Active only for users who have NOT set up a userbot.
+                 Skipped for any user whose userbot is already running
+                 (avoids duplicate forwards).
 
-  USERBOT path — one Pyrogram Client per user who has a stored userbot
-                 session.  Handles ALL source channels for that user,
-                 including private ones the bot cannot read.
+  USERBOT path — one Pyrogram Client per user with a saved userbot
+                 session.  Handles ALL their source channels, including
+                 private ones the main bot cannot join.
 
-Filters  — per-user filter config (types, size, keywords, extensions)
-           loaded from AF config in MongoDB and applied before buffering.
+On every incoming channel message each path:
+  1. Checks that the chat is a configured source for this user.
+  2. Runs the user's AF filter (types / size / keywords / extensions).
+  3. Calls copy_message() to each target directly — no queue, no buffer.
 
-Speed    — per-user speed mode (safe / normal / fast) that controls
-           extra inter-message delay added on top of the rate limiter.
+FloodWait is handled by sleeping the exact amount Telegram requests and
+then retrying once before giving up on that particular target.
 
-           Mode     Extra delay/msg   Buffer flush
-           safe     3.0 s             8 s
-           normal   1.0 s             4 s
-           fast     0.0 s             2 s
+Speed mode extra delay
+──────────────────────
+  safe   → 3.0 s sleep after each copy_message call
+  normal → 1.0 s
+  fast   → 0.0 s  (no extra sleep)
 
-Rate limiting is fully delegated to plugins/rate_limiter.py:
-  • Per-channel token bucket   (max 12 msgs/min per target channel)
-  • Per-client global bucket   (max 15 msgs/s for bot, 4/s for userbot)
-  • Circuit-breaker per target (pauses a broken target for 10 min)
-  • FloodWait drain            (respects exact Telegram wait + jitter)
-  • PeerFlood cooldown         (1-hour freeze when account is flagged)
+This is purely an optional throttle the user controls via ⚡ Speed.
 """
 
 import asyncio
 import logging
 import re
-from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict
 
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
 
 from config import Config
@@ -53,33 +52,15 @@ _MEDIA = (
     | filters.animation
 )
 
-# ── Speed constants ───────────────────────────────────────────────────────────
-# Extra sleep added AFTER each safe_copy_message call, on top of the rate limiter.
+# ── Speed extra delay (optional, purely cosmetic throttle) ────────────────────
 SPEED_EXTRA_DELAY: dict = {
     "safe":   3.0,
     "normal": 1.0,
     "fast":   0.0,
 }
-# How long to buffer incoming messages before flushing to the queue.
-# Longer = more complete media-group batching; shorter = lower latency.
-SPEED_BUFFER_DELAY: dict = {
-    "safe":   8.0,
-    "normal": 4.0,
-    "fast":   2.0,
-}
-DEFAULT_BUFFER_DELAY = SPEED_BUFFER_DELAY[AF_DEFAULT_SPEED]
 
 # ── Running userbot clients  {user_id → Client} ───────────────────────────────
 _running_userbots: Dict[int, Client] = {}
-
-# ── Message buffer ────────────────────────────────────────────────────────────
-# {source_chat_id → [(Message, [target_ids], Client, is_ub, speed)]}
-_buffers:     Dict[int, List[Tuple]] = defaultdict(list)
-_flush_tasks: Dict[int, asyncio.Task] = {}
-
-# ── Forward queue  items: ([Message], [target_ids], Client, is_ub, speed) ─────
-_queue: asyncio.Queue = asyncio.Queue()
-_queue_running = False
 
 
 # ── Filter helper ─────────────────────────────────────────────────────────────
@@ -88,30 +69,30 @@ def _passes_af_filter(message, af_cfg: dict) -> bool:
     """
     Return True if the message satisfies all active filter conditions.
 
-    Checks (in order):
+    Checks:
       1. Media type is in the enabled-types list
-      2. File size is within [min_size_mb, max_size_mb] (0 = no limit)
-      3. Filename contains at least one keyword (if keywords set)
-      4. File extension is in the allowed list (if extensions set)
+      2. File size within [min_size_mb, max_size_mb]  (0 = no limit)
+      3. Filename contains at least one keyword        (if set)
+      4. File extension is in the allowed list         (if set)
     """
     if not message.media:
         return False
 
-    media_type  = message.media.value          # "video", "document", "photo", …
+    media_type  = message.media.value          # e.g. "video", "document" …
     filters_cfg = af_cfg.get("filters", AF_DEFAULT_FILTERS)
 
-    # 1. Type filter
+    # 1. Type
     enabled_types = filters_cfg.get("types", AF_DEFAULT_FILTERS["types"])
     if media_type not in enabled_types:
         return False
 
-    # Fetch the media object for size/name checks
+    # Grab the media sub-object for size/name
     media_obj = getattr(message, media_type, None)
     file_size = getattr(media_obj, "file_size", 0) or 0
     file_name = getattr(media_obj, "file_name", "") or ""
     size_mb   = file_size / 1024 / 1024
 
-    # 2. Size filter
+    # 2. Size
     min_mb = float(filters_cfg.get("min_size_mb", 0) or 0)
     max_mb = float(filters_cfg.get("max_size_mb", 0) or 0)
     if min_mb > 0 and size_mb < min_mb:
@@ -119,14 +100,14 @@ def _passes_af_filter(message, af_cfg: dict) -> bool:
     if max_mb > 0 and size_mb > max_mb:
         return False
 
-    # 3. Keyword filter (filename must match at least one keyword)
+    # 3. Keywords (filename must match at least one)
     keywords = filters_cfg.get("keywords", [])
     if keywords and file_name:
         pattern = "|".join(re.escape(k) for k in keywords)
         if not re.search(pattern, file_name, re.IGNORECASE):
             return False
 
-    # 4. Extension filter
+    # 4. Extensions
     extensions = filters_cfg.get("extensions", [])
     if extensions and file_name and "." in file_name:
         ext     = file_name.rsplit(".", 1)[-1].lower()
@@ -137,118 +118,65 @@ def _passes_af_filter(message, af_cfg: dict) -> bool:
     return True
 
 
-# ── Queue worker ──────────────────────────────────────────────────────────────
+# ── Core send helper ──────────────────────────────────────────────────────────
 
-async def _queue_worker():
+async def _do_copy(client: Client, tid: int, msg, label: str = "") -> bool:
     """
-    Consume forwarding jobs one by one.
-    Each job: (messages, target_ids, copy_client, is_userbot, speed).
-
-    After every safe_copy_message call the speed-mode extra delay is applied,
-    giving three distinct throughput levels on top of the hard rate limits.
+    copy_message to a single target.  On FloodWait, sleep and retry once.
+    Returns True on success, False on failure.
     """
-    while True:
+    for attempt in range(2):
         try:
-            messages, target_ids, copy_client, is_ub, speed = await _queue.get()
-            extra = SPEED_EXTRA_DELAY.get(speed, SPEED_EXTRA_DELAY[AF_DEFAULT_SPEED])
-
-            for msg in sorted(messages, key=lambda m: m.id):
-                for tid in target_ids:
-                    try:
-                        await copy_client.copy_message(
-                            chat_id          = tid,
-                            from_chat_id     = msg.chat.id,
-                            message_id       = msg.id,
-                            caption          = msg.caption,
-                            caption_entities = msg.caption_entities if msg.caption else None,
-                        )
-                    except Exception as e:
-                        from pyrogram.errors import FloodWait
-                        if isinstance(e, FloodWait):
-                            await asyncio.sleep(e.value)
-                        else:
-                            logger.error(f"[af_engine] copy_message error → {tid}: {e}")
-                    if extra > 0:
-                        await asyncio.sleep(extra)
-
-            _queue.task_done()
-
-        except asyncio.CancelledError:
-            break
+            await client.copy_message(
+                chat_id          = tid,
+                from_chat_id     = msg.chat.id,
+                message_id       = msg.id,
+                caption          = msg.caption,
+                caption_entities = msg.caption_entities if msg.caption else None,
+            )
+            return True
+        except FloodWait as e:
+            if attempt == 0:
+                logger.warning(f"[af_engine]{label} FloodWait {e.value}s → {tid}")
+                await asyncio.sleep(e.value + 1)
+            else:
+                logger.error(f"[af_engine]{label} FloodWait again → {tid}, skipping")
+                return False
         except Exception as e:
-            logger.error(f"[af_engine] queue worker error: {e}", exc_info=True)
-            await asyncio.sleep(1)
+            logger.error(f"[af_engine]{label} copy_message failed → {tid}: {e}")
+            return False
+    return False
 
 
-# ── Buffer helpers ────────────────────────────────────────────────────────────
-
-async def _flush(source_id: int):
-    """
-    Wait for the buffer delay appropriate to the speed mode, then push the
-    accumulated batch onto the queue.  The delay is taken from the FIRST
-    item in the buffer so media groups with mixed users are handled correctly.
-    """
-    first = _buffers.get(source_id, [None])[0]
-    if first:
-        _, _, _, _, speed = first
-        delay = SPEED_BUFFER_DELAY.get(speed, DEFAULT_BUFFER_DELAY)
-    else:
-        delay = DEFAULT_BUFFER_DELAY
-    await asyncio.sleep(delay)
-
-    items = _buffers.pop(source_id, [])
-    _flush_tasks.pop(source_id, None)
-    if not items:
-        return
-
-    # Group items by (frozenset of targets, client identity) to deduplicate
-    groups: dict = {}
-    for msg, target_ids, copy_client, is_ub, speed in items:
-        key = (frozenset(target_ids), id(copy_client))
-        if key not in groups:
-            groups[key] = ([], list(target_ids), copy_client, is_ub, speed)
-        groups[key][0].append(msg)
-
-    for msgs, tids, cli, is_ub, speed in groups.values():
-        await _queue.put((msgs, tids, cli, is_ub, speed))
-        logger.info(
-            f"[af_engine] queued {len(msgs)} msg(s) "
-            f"from {source_id} → {len(tids)} target(s)  [speed={speed}]"
-        )
-
-
-def _add_to_buffer(
-    source_id:   int,
-    message,
-    target_ids:  List[int],
-    copy_client: Client,
-    is_userbot:  bool,
-    speed:       str,
+async def _forward_to_targets(
+    client:     Client,
+    msg,
+    target_ids: list,
+    speed:      str,
+    label:      str = "",
 ):
-    _buffers[source_id].append((message, target_ids, copy_client, is_userbot, speed))
-    # Reset flush timer so the whole batch waits together
-    if source_id in _flush_tasks:
-        _flush_tasks[source_id].cancel()
-    _flush_tasks[source_id] = asyncio.create_task(_flush(source_id))
+    """
+    Forward one message to every target in target_ids.
+    Applies the speed-mode extra delay between sends.
+    """
+    extra = SPEED_EXTRA_DELAY.get(speed, SPEED_EXTRA_DELAY[AF_DEFAULT_SPEED])
+    for idx, tid in enumerate(target_ids):
+        await _do_copy(client, tid, msg, label)
+        if extra > 0 and idx < len(target_ids) - 1:
+            await asyncio.sleep(extra)
 
 
 # ── Startup helpers ───────────────────────────────────────────────────────────
 
 async def start_af_queue(bot_client: Client):
-    """Start the queue worker. Call once after bot.start()."""
-    global _queue_running
-    if _queue_running:
-        return
-    _queue_running = True
-    asyncio.create_task(_queue_worker())
-    logger.info("[af_engine] queue worker started")
+    """No-op kept for import compatibility with main.py."""
+    logger.info("[af_engine] direct-forward mode active (no queue/buffer)")
 
 
 async def start_all_userbot_af():
     """
-    Called at bot startup.
-    For every user who has an AF config with sources+targets AND a saved
-    userbot session, start one Pyrogram client to monitor their sources.
+    At bot startup: for every user with AF sources+targets and a saved
+    userbot session, start one Pyrogram client to monitor their channels.
     """
     configs = await db.get_all_af_configs()
     started = 0
@@ -263,16 +191,12 @@ async def start_all_userbot_af():
             await start_userbot_af(uid, ub_data["session"])
             started += 1
         except Exception as e:
-            logger.error(f"[af_engine] Could not start userbot for user {uid}: {e}")
+            logger.error(f"[af_engine] Could not start userbot for {uid}: {e}")
     logger.info(f"[af_engine] {started} userbot AF client(s) started at boot")
 
 
 async def start_userbot_af(user_id: int, session_string: str) -> None:
-    """
-    Start (or restart) the userbot Pyrogram client for user_id.
-    The client registers its own MessageHandler for channel media.
-    Filters and speed are fetched from the user's AF config per message.
-    """
+    """Start (or restart) the userbot Pyrogram client for user_id."""
     await stop_userbot_af(user_id)
 
     ub = Client(
@@ -285,10 +209,9 @@ async def start_userbot_af(user_id: int, session_string: str) -> None:
 
     async def _handler(ub_client: Client, message):
         try:
-            source_id = message.chat.id
-            cfg       = await db.get_af_config(user_id)
+            source_id  = message.chat.id
+            cfg        = await db.get_af_config(user_id)
 
-            # Check source membership
             if not any(s["id"] == source_id for s in cfg.get("sources", [])):
                 return
 
@@ -296,16 +219,26 @@ async def start_userbot_af(user_id: int, session_string: str) -> None:
             if not target_ids:
                 return
 
-            # Apply filters
             if not _passes_af_filter(message, cfg):
-                logger.debug(f"[af_engine] msg {message.id} filtered out for user {user_id}")
+                logger.debug(
+                    f"[af_engine] ub: msg {message.id} filtered out for {user_id}"
+                )
                 return
 
             speed = cfg.get("speed", AF_DEFAULT_SPEED)
-            _add_to_buffer(source_id, message, target_ids, ub_client,
-                           is_userbot=True, speed=speed)
+            logger.info(
+                f"[af_engine] ub: forwarding msg {message.id} "
+                f"from {source_id} → {target_ids} [speed={speed}]"
+            )
+            await _forward_to_targets(
+                ub_client, message, target_ids, speed,
+                label=f" [ub:{user_id}]",
+            )
         except Exception as e:
-            logger.error(f"[af_engine] userbot handler error (uid {user_id}): {e}")
+            logger.error(
+                f"[af_engine] userbot handler error (uid {user_id}): {e}",
+                exc_info=True,
+            )
 
     ub.add_handler(MessageHandler(_handler, filters.channel & _MEDIA))
     await ub.start()
@@ -329,34 +262,38 @@ async def stop_userbot_af(user_id: int) -> None:
 
 
 # ── Bot-side channel handler ──────────────────────────────────────────────────
-# Only forwards for users whose userbot is NOT running — avoids duplication.
+# Skipped for any user whose userbot is already handling the same source.
 
 @Client.on_message(filters.channel & _MEDIA)
 async def _bot_channel_handler(bot_client: Client, message):
     try:
-        source_id = message.chat.id
-
-        # get_source_users → [(user_id, [target_ids], full_cfg_doc), ...]
+        source_id    = message.chat.id
         user_entries = await db.get_source_users(source_id)
         if not user_entries:
             return
 
         for uid, tids, cfg in user_entries:
-            # Skip users whose userbot is already handling this source
+            # Skip — userbot is already watching for this user
             if uid in _running_userbots:
                 continue
 
-            # Apply per-user filters
             if not _passes_af_filter(message, cfg):
                 logger.debug(
-                    f"[af_engine] bot: msg {message.id} filtered out for user {uid}"
+                    f"[af_engine] bot: msg {message.id} filtered out for {uid}"
                 )
                 continue
 
             speed = cfg.get("speed", AF_DEFAULT_SPEED)
-            _add_to_buffer(
-                source_id, message, tids,
-                bot_client, is_userbot=False, speed=speed,
+            logger.info(
+                f"[af_engine] bot: forwarding msg {message.id} "
+                f"from {source_id} → {tids} [speed={speed}]"
+            )
+            # Run each user's forward concurrently
+            asyncio.create_task(
+                _forward_to_targets(
+                    bot_client, message, tids, speed,
+                    label=f" [bot→{uid}]",
+                )
             )
 
     except Exception as e:

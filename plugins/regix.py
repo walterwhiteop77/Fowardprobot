@@ -171,40 +171,51 @@ async def pub_(bot, message):
 async def copy(user, bot, msg, m, sts, is_ub=False):
     to_chat   = sts.get('TO')
     from_chat = sts.get('FROM')
-    try:
-        if msg.get("media") and msg.get("caption"):
-            await bot.send_cached_media(
-                chat_id         = to_chat,
-                file_id         = msg["media"],
-                caption         = msg.get("caption"),
-                reply_markup    = msg.get("button"),
-                protect_content = bool(msg.get("protect")),
-            )
-        else:
-            await bot.copy_message(
-                chat_id          = to_chat,
-                from_chat_id     = from_chat,
-                message_id       = msg["msg_id"],
-                caption          = msg.get("caption"),
-                reply_markup     = msg.get("button"),
-                protect_content  = bool(msg.get("protect")),
-            )
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-    except Exception:
-        sts.add('deleted')
+    for attempt in range(2):
+        try:
+            if msg.get("media") and msg.get("caption"):
+                await bot.send_cached_media(
+                    chat_id         = to_chat,
+                    file_id         = msg["media"],
+                    caption         = msg.get("caption"),
+                    reply_markup    = msg.get("button"),
+                    protect_content = bool(msg.get("protect")),
+                )
+            else:
+                await bot.copy_message(
+                    chat_id          = to_chat,
+                    from_chat_id     = from_chat,
+                    message_id       = msg["msg_id"],
+                    caption          = msg.get("caption"),
+                    reply_markup     = msg.get("button"),
+                    protect_content  = bool(msg.get("protect")),
+                )
+            return  # success
+        except FloodWait as e:
+            if attempt == 0:
+                await asyncio.sleep(e.value + 1)
+            else:
+                sts.add('deleted')
+        except Exception:
+            sts.add('deleted')
+            return
 
 
 async def forward(user, bot, msg, m, sts, protect, is_ub=False):
-    try:
-        await bot.forward_messages(
-            chat_id         = sts.get('TO'),
-            from_chat_id    = sts.get('FROM'),
-            message_ids     = msg,
-            protect_content = protect,
-        )
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
+    for attempt in range(2):
+        try:
+            await bot.forward_messages(
+                chat_id         = sts.get('TO'),
+                from_chat_id    = sts.get('FROM'),
+                message_ids     = msg,
+                protect_content = protect,
+            )
+            return
+        except FloodWait as e:
+            if attempt == 0:
+                await asyncio.sleep(e.value + 1)
+        except Exception:
+            return
 
 
 async def msg_edit(msg, text, button=None, wait=None):
