@@ -1,6 +1,18 @@
 import motor.motor_asyncio
 from config import Config
 
+# ── Auto-forward defaults ─────────────────────────────────────────────────────
+
+AF_DEFAULT_FILTERS: dict = {
+    "types":       ["video", "document", "photo", "audio", "voice", "animation"],
+    "min_size_mb": 0,
+    "max_size_mb": 0,
+    "keywords":    [],
+    "extensions":  [],
+}
+AF_DEFAULT_SPEED: str = "normal"
+
+
 class Db:
 
     def __init__(self, uri, database_name):
@@ -243,16 +255,48 @@ class Db:
 
     async def get_source_users(self, source_id: int) -> list:
         """
-        Return list of (user_id, [target_ids]) for every user
+        Return list of (user_id, [target_ids], full_cfg_doc) for every user
         who has source_id in their sources list.
-        Used by the bot-side channel handler.
+        Used by the bot-side channel handler so filters/speed are accessible.
         """
         results = []
         async for doc in self.afc.find({"sources.id": int(source_id)}):
             targets = [t["id"] for t in doc.get("targets", [])]
             if targets:
-                results.append((doc["user_id"], targets))
+                results.append((doc["user_id"], targets, doc))
         return results
+
+    # ── Filter / Speed helpers ─────────────────────────────────────────────────
+
+    async def get_af_filters(self, user_id: int) -> dict:
+        """Return the user's AF filter config, defaulting to AF_DEFAULT_FILTERS."""
+        doc = await self.afc.find_one({"user_id": int(user_id)})
+        if doc and "filters" in doc:
+            return doc["filters"]
+        return dict(AF_DEFAULT_FILTERS)
+
+    async def set_af_filters(self, user_id: int, filters_cfg: dict):
+        """Persist the user's AF filter config."""
+        await self.afc.update_one(
+            {"user_id": int(user_id)},
+            {"$set": {"filters": filters_cfg}},
+            upsert=True,
+        )
+
+    async def get_af_speed(self, user_id: int) -> str:
+        """Return the user's AF speed mode, defaulting to AF_DEFAULT_SPEED."""
+        doc = await self.afc.find_one({"user_id": int(user_id)})
+        if doc:
+            return doc.get("speed", AF_DEFAULT_SPEED)
+        return AF_DEFAULT_SPEED
+
+    async def set_af_speed(self, user_id: int, speed: str):
+        """Persist the user's AF speed mode ('safe', 'normal', or 'fast')."""
+        await self.afc.update_one(
+            {"user_id": int(user_id)},
+            {"$set": {"speed": speed}},
+            upsert=True,
+        )
 
 
     # ── Allowlist helpers ─────────────────────────────────────────────────────
