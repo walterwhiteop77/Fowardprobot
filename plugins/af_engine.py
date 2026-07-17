@@ -14,10 +14,15 @@ Two forwarding paths:
 On every incoming channel message each path:
   1. Checks that the chat is a configured source for this user.
   2. Runs the user's AF filter (types / size / keywords / extensions).
-  3. Calls copy_message() to each target directly — no queue, no buffer.
+  3. Calls copy_message() to each target through a per-target lock so that
+     bulk/album bursts are serialised — no concurrent FloodWait races.
 
-FloodWait is handled by sleeping the exact amount Telegram requests and
-then retrying once before giving up on that particular target.
+FloodWait handling
+──────────────────
+Each send is protected by a per-target asyncio.Lock.  When 5-6 messages
+arrive simultaneously they queue up per-target so only ONE copy_message
+is in-flight to a given target at any time.  On FloodWait we sleep the
+exact amount Telegram requests and retry once before giving up.
 
 Speed mode extra delay
 ──────────────────────
@@ -61,6 +66,18 @@ SPEED_EXTRA_DELAY: dict = {
 
 # ── Running userbot clients  {user_id → Client} ───────────────────────────────
 _running_userbots: Dict[int, Client] = {}
+
+# ── Per-target send locks ─────────────────────────────────────────────────────
+# Serialises copy_message calls to the same target so that a burst of 5-6
+# simultaneous messages doesn't cause concurrent FloodWait races where all
+# tasks retry at the same instant and all get dropped.
+_target_locks: Dict[int, asyncio.Lock] = {}
+
+
+def _get_target_lock(tid: int) -> asyncio.Lock:
+    if tid not in _target_locks:
+        _target_locks[tid] = asyncio.Lock()
+    return _target_locks[tid]
 
 
 # ── Filter helper ─────────────────────────────────────────────────────────────
@@ -122,29 +139,41 @@ def _passes_af_filter(message, af_cfg: dict) -> bool:
 
 async def _do_copy(client: Client, tid: int, msg, label: str = "") -> bool:
     """
-    copy_message to a single target.  On FloodWait, sleep and retry once.
+    copy_message to a single target.
+
+    Acquires a per-target lock first so that burst/album messages sent at the
+    same time are serialised — only one copy_message call is in-flight to a
+    given target at any moment.  On FloodWait, sleep the exact time Telegram
+    requests and retry once before giving up.
+
     Returns True on success, False on failure.
     """
-    for attempt in range(2):
-        try:
-            await client.copy_message(
-                chat_id          = tid,
-                from_chat_id     = msg.chat.id,
-                message_id       = msg.id,
-                caption          = msg.caption,
-                caption_entities = msg.caption_entities if msg.caption else None,
-            )
-            return True
-        except FloodWait as e:
-            if attempt == 0:
-                logger.warning(f"[af_engine]{label} FloodWait {e.value}s → {tid}")
-                await asyncio.sleep(e.value + 1)
-            else:
-                logger.error(f"[af_engine]{label} FloodWait again → {tid}, skipping")
+    lock = _get_target_lock(tid)
+    async with lock:
+        for attempt in range(2):
+            try:
+                await client.copy_message(
+                    chat_id          = tid,
+                    from_chat_id     = msg.chat.id,
+                    message_id       = msg.id,
+                    caption          = msg.caption,
+                    caption_entities = msg.caption_entities if msg.caption else None,
+                )
+                return True
+            except FloodWait as e:
+                if attempt == 0:
+                    logger.warning(
+                        f"[af_engine]{label} FloodWait {e.value}s → {tid}, sleeping…"
+                    )
+                    await asyncio.sleep(e.value + 1)
+                else:
+                    logger.error(
+                        f"[af_engine]{label} FloodWait again → {tid}, skipping"
+                    )
+                    return False
+            except Exception as e:
+                logger.error(f"[af_engine]{label} copy_message failed → {tid}: {e}")
                 return False
-        except Exception as e:
-            logger.error(f"[af_engine]{label} copy_message failed → {tid}: {e}")
-            return False
     return False
 
 
@@ -158,6 +187,7 @@ async def _forward_to_targets(
     """
     Forward one message to every target in target_ids.
     Applies the speed-mode extra delay between sends.
+    The per-target lock inside _do_copy handles concurrent bursts automatically.
     """
     extra = SPEED_EXTRA_DELAY.get(speed, SPEED_EXTRA_DELAY[AF_DEFAULT_SPEED])
     for idx, tid in enumerate(target_ids):
@@ -288,7 +318,9 @@ async def _bot_channel_handler(bot_client: Client, message):
                 f"[af_engine] bot: forwarding msg {message.id} "
                 f"from {source_id} → {tids} [speed={speed}]"
             )
-            # Run each user's forward concurrently
+            # Run each user's forward concurrently.
+            # Per-target locks inside _do_copy ensure burst messages to the
+            # same target are still serialised, so no concurrent FloodWaits.
             asyncio.create_task(
                 _forward_to_targets(
                     bot_client, message, tids, speed,
