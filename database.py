@@ -4,7 +4,10 @@ from config import Config
 # ── Auto-forward defaults ─────────────────────────────────────────────────────
 
 AF_DEFAULT_FILTERS: dict = {
-    "types":       ["video", "document", "photo", "audio", "voice", "animation"],
+    "types":       [
+        "video", "document", "photo", "audio", "voice", "animation",
+        "video_note", "sticker",
+    ],
     "min_size_mb": 0,
     "max_size_mb": 0,
     "keywords":    [],
@@ -220,6 +223,14 @@ class Db:
             {"$push": {"sources": {"id": int(chat_id), "title": title}}},
         )
         return "added"
+
+    async def touch_af_config(self, user_id: int):
+        """Ensure the AF config exists and bump it so listeners can refresh."""
+        await self._ensure_af_doc(user_id)
+        await self.afc.update_one(
+            {"user_id": int(user_id)},
+            {"$set": {"updated_at": __import__("datetime").datetime.utcnow()}},
+        )
 
     async def remove_af_source(self, user_id: int, chat_id: int):
         await self.afc.update_one(
