@@ -1,37 +1,17 @@
 """
-Auto-Forward Engine (hardened for 100% delivery)
-────────────────────────────────────────────────
-Delivery guarantees compared to the previous version:
+Auto-Forward Engine (reliable many-to-many delivery)
+────────────────────────────────────────────────────
 
-  1. FloodWait is NEVER given up on.  We honor Telegram's requested
-     wait for as long as it asks, message stays in the retry loop.
-     Previously we gave up after 5 attempts → messages were silently
-     dropped during long bursts.
-
-  2. Non-FloodWait exceptions are retried with exponential backoff
-     up to 10 attempts (2s → 60s cap) before being logged CRITICAL.
-     Transient network / RPC errors no longer skip files.
-
-  3. Deduplication cache keyed by (source_chat, message_id, target)
-     — retries can no longer produce duplicate posts, and multiple
-     concurrent handlers for the same message won't double-send.
-
-  4. Album / media-group aware.  When a message belongs to an album
-     we copy the WHOLE group with one `copy_media_group()` call and
-     mark the group as processed, so the remaining group items don't
-     each queue their own send.
-
-  5. Handler wraps every step in try/except.  Any handler-side error
-     is logged, but never blocks the message loop.
-
-  6. Bursts to the same target are still serialised by a per-target
-     asyncio.Lock, so we don't cause a self-inflicted FloodWait storm.
-
-Speed mode inter-message delay (inside the per-target lock)
-────────────────────────────────────────────────────────────
-  safe   → 3.0 s   (max protection, lowest ban risk)
-  normal → 1.0 s   (balanced, recommended)
-  fast   → 0.5 s   (minimum floor — still avoids burst rate-limits)
+Fixes included here:
+  • All enabled media types are watched from channels and groups.
+  • Every matching source is copied to every target; targets run independently.
+  • Userbot and bot-side listeners can both try the same message.  Dedup happens
+    only after a successful target copy, so a failed listener cannot suppress the
+    other one and lose files.
+  • FloodWait and transient RPC/network errors are retried forever.  Only fatal
+    permission/message errors stop retrying for that one target.
+  • Albums are copied as one media group and deduped per source/group/target.
+  • Fire-and-forget tasks are tracked so crashes are logged instead of silent.
 """
 
 import asyncio
@@ -50,7 +30,11 @@ from database import db, AF_DEFAULT_FILTERS, AF_DEFAULT_SPEED
 
 logger = logging.getLogger(__name__)
 
-# ── Media filter ──────────────────────────────────────────────────────────────
+_LEGACY_DEFAULT_TYPES = {"video", "document", "photo", "audio", "voice", "animation"}
+
+
+# ── Media/source filters ──────────────────────────────────────────────────────
+
 _MEDIA = (
     filters.video
     | filters.document
@@ -58,21 +42,33 @@ _MEDIA = (
     | filters.audio
     | filters.voice
     | filters.animation
+    | filters.video_note
+    | filters.sticker
 )
 
+# Watch channels and groups/supergroups.  Some source chats are added as
+# supergroups, not plain broadcast channels; filtering only channels misses them.
+_SOURCE_MESSAGES = (filters.channel | filters.group) & _MEDIA
+
+
 # ── Inter-message delay inside the per-target lock ────────────────────────────
-_MIN_DELAY = 0.5  # absolute floor between sends to same target
+
+_MIN_DELAY = 0.5
 
 SPEED_DELAY: dict = {
-    "safe":   3.0,
+    "safe": 3.0,
     "normal": 1.0,
-    "fast":   _MIN_DELAY,
+    "fast": _MIN_DELAY,
 }
 
-# ── Running userbot clients  {user_id → Client} ───────────────────────────────
+
+# ── Running userbot clients {user_id → Client} ────────────────────────────────
+
 _running_userbots: Dict[int, Client] = {}
 
+
 # ── Per-target send locks ─────────────────────────────────────────────────────
+
 _target_locks: Dict[int, asyncio.Lock] = {}
 
 
@@ -82,15 +78,19 @@ def _get_target_lock(tid: int) -> asyncio.Lock:
     return _target_locks[tid]
 
 
-# ── Bounded LRU-ish dedup stores ──────────────────────────────────────────────
-# Guarantees no duplicate sends even when retries loop, and lets us skip
-# subsequent items of an album that we've already forwarded as a group.
-_DEDUP_MAX = 20000
+# ── Bounded dedup stores ──────────────────────────────────────────────────────
 
-# key: (source_chat_id, message_id, target_id)
+_DEDUP_MAX = 50000
+
+# Single message key: (source_chat_id, message_id, target_id)
 _msg_dedup: "OrderedDict[Tuple[int, int, int], float]" = OrderedDict()
 
-# key: (source_chat_id, media_group_id, user_id) — one entry per (album, user)
+# Album key: (source_chat_id, media_group_id, target_id, "album")
+_album_dedup: "OrderedDict[Tuple[int, str, int, str], float]" = OrderedDict()
+
+# Kept for import/backward compatibility with the previous build.  The engine no
+# longer suppresses handlers before successful send; doing so was one cause of
+# missing album/files from some sources.
 _group_seen: "OrderedDict[Tuple[int, str, int], float]" = OrderedDict()
 
 
@@ -104,29 +104,26 @@ def _remember(store: OrderedDict, key, cap: int = _DEDUP_MAX) -> None:
 # ── Filter helper ─────────────────────────────────────────────────────────────
 
 def _passes_af_filter(message, af_cfg: dict) -> bool:
-    """
-    Return True if the message satisfies all active filter conditions.
-
-    Checks:
-      1. Media type is in the enabled-types list
-      2. File size within [min_size_mb, max_size_mb]  (0 = no limit)
-      3. Filename contains at least one keyword        (if set)
-      4. File extension is in the allowed list         (if set)
-    """
-    if not message.media:
+    """Return True if the message satisfies all active auto-forward filters."""
+    if not getattr(message, "media", None):
         return False
 
-    media_type  = message.media.value
-    filters_cfg = af_cfg.get("filters", AF_DEFAULT_FILTERS)
+    media_type = message.media.value
+    filters_cfg = af_cfg.get("filters") or AF_DEFAULT_FILTERS
 
-    enabled_types = filters_cfg.get("types", AF_DEFAULT_FILTERS["types"])
+    enabled_types = list(filters_cfg.get("types") or AF_DEFAULT_FILTERS["types"])
+    # Existing MongoDB configs created by older builds only contain the legacy
+    # six media types. Treat that as "all default media" so stickers/video notes
+    # are not silently skipped after upgrading.
+    if set(enabled_types) == _LEGACY_DEFAULT_TYPES:
+        enabled_types = list(AF_DEFAULT_FILTERS["types"])
     if media_type not in enabled_types:
         return False
 
     media_obj = getattr(message, media_type, None)
     file_size = getattr(media_obj, "file_size", 0) or 0
     file_name = getattr(media_obj, "file_name", "") or ""
-    size_mb   = file_size / 1024 / 1024
+    size_mb = file_size / 1024 / 1024
 
     min_mb = float(filters_cfg.get("min_size_mb", 0) or 0)
     max_mb = float(filters_cfg.get("max_size_mb", 0) or 0)
@@ -135,15 +132,18 @@ def _passes_af_filter(message, af_cfg: dict) -> bool:
     if max_mb > 0 and size_mb > max_mb:
         return False
 
-    keywords = filters_cfg.get("keywords", [])
+    # Filename-only filters should not accidentally drop media with no filename
+    # (photos, voice, video notes, stickers).  They only apply when a filename is
+    # available to inspect.
+    keywords = filters_cfg.get("keywords", []) or []
     if keywords and file_name:
         pattern = "|".join(re.escape(k) for k in keywords)
         if not re.search(pattern, file_name, re.IGNORECASE):
             return False
 
-    extensions = filters_cfg.get("extensions", [])
+    extensions = filters_cfg.get("extensions", []) or []
     if extensions and file_name and "." in file_name:
-        ext     = file_name.rsplit(".", 1)[-1].lower()
+        ext = file_name.rsplit(".", 1)[-1].lower()
         allowed = [e.lower().lstrip(".") for e in extensions]
         if ext not in allowed:
             return False
@@ -151,30 +151,54 @@ def _passes_af_filter(message, af_cfg: dict) -> bool:
     return True
 
 
+# ── Retry helpers ─────────────────────────────────────────────────────────────
+
+_FATAL_COPY_ERRORS = (
+    "CHAT_ADMIN_REQUIRED",
+    "CHAT_WRITE_FORBIDDEN",
+    "USER_BANNED_IN_CHANNEL",
+    "CHANNEL_PRIVATE",
+    "PEER_ID_INVALID",
+    "MESSAGE_ID_INVALID",
+    "MSG_ID_INVALID",
+    "MESSAGE_EMPTY",
+    "MEDIA_EMPTY",
+    "FILE_REFERENCE_EMPTY",
+    "BOT_METHOD_INVALID",
+)
+
+
+def _is_fatal_copy_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".upper()
+    return any(marker in text for marker in _FATAL_COPY_ERRORS)
+
+
+def _track_task(task: asyncio.Task, label: str) -> None:
+    """Make background task failures visible in bot.log/stdout."""
+
+    def _done(done: asyncio.Task):
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            logger.warning(f"[af_engine]{label} task cancelled")
+        except Exception as e:
+            logger.error(f"[af_engine]{label} task crashed: {e}", exc_info=True)
+
+    task.add_done_callback(_done)
+
+
 # ── Core send helpers ─────────────────────────────────────────────────────────
 
-# Cap on non-FloodWait error retries. FloodWait is never capped — Telegram's
-# requested wait is always honored so no message is dropped during throttling.
-_ERROR_RETRY_MAX = 10
-
-
 async def _copy_single(
-    client:      Client,
-    tid:         int,
+    client: Client,
+    tid: int,
     msg,
     inter_delay: float,
-    label:       str,
+    label: str,
 ) -> bool:
-    """
-    Copy one (non-album) message to `tid`, retrying until it succeeds.
-
-    • Per-target lock serialises burst sends to the same chat.
-    • FloodWait is honoured indefinitely — never dropped.
-    • Other exceptions retry with exponential backoff (up to 10 attempts).
-    • Dedup ensures a retried send cannot double-post.
-    """
+    """Copy one non-album message to one target with persistent retries."""
     dedup_key = (msg.chat.id, msg.id, tid)
-    lock      = _get_target_lock(tid)
+    lock = _get_target_lock(tid)
 
     async with lock:
         if dedup_key in _msg_dedup:
@@ -186,11 +210,11 @@ async def _copy_single(
             attempt += 1
             try:
                 await client.copy_message(
-                    chat_id          = tid,
-                    from_chat_id     = msg.chat.id,
-                    message_id       = msg.id,
-                    caption          = msg.caption,
-                    caption_entities = msg.caption_entities if msg.caption else None,
+                    chat_id=tid,
+                    from_chat_id=msg.chat.id,
+                    message_id=msg.id,
+                    caption=msg.caption,
+                    caption_entities=msg.caption_entities if msg.caption else None,
                 )
                 _remember(_msg_dedup, dedup_key)
                 await asyncio.sleep(inter_delay)
@@ -200,47 +224,41 @@ async def _copy_single(
                 wait = int(e.value) + 2
                 logger.warning(
                     f"[af_engine]{label} FloodWait {e.value}s → {tid} "
-                    f"msg {msg.id} (attempt {attempt}), sleeping {wait}s…"
+                    f"msg {msg.id} attempt {attempt}; sleeping {wait}s"
                 )
                 await asyncio.sleep(wait)
-                # never break — always retry after FloodWait
 
             except Exception as e:
-                logger.error(
-                    f"[af_engine]{label} copy_message failed → {tid} "
-                    f"msg {msg.id} (attempt {attempt}/{_ERROR_RETRY_MAX}): {e}"
-                )
-                if attempt >= _ERROR_RETRY_MAX:
+                if _is_fatal_copy_error(e):
                     logger.critical(
-                        f"[af_engine]{label} PERMANENT FAIL → {tid} "
+                        f"[af_engine]{label} fatal copy failure → {tid} "
                         f"msg {msg.id}: {e}"
                     )
                     return False
-                # exponential backoff, capped at 60s
-                await asyncio.sleep(min(2 ** attempt, 60))
+
+                wait = min(2 ** min(attempt, 6), 60)
+                logger.error(
+                    f"[af_engine]{label} transient copy failure → {tid} "
+                    f"msg {msg.id} attempt {attempt}: {e}; retrying in {wait}s"
+                )
+                await asyncio.sleep(wait)
 
 
 async def _copy_album(
-    client:      Client,
-    tid:         int,
+    client: Client,
+    tid: int,
     msg,
     inter_delay: float,
-    label:       str,
+    label: str,
 ) -> bool:
-    """
-    Copy the entire media group that `msg` belongs to as a single album
-    via copy_media_group.  Same retry / dedup semantics as _copy_single.
-    """
-    mgid      = str(msg.media_group_id)
-    dedup_key = (msg.chat.id, msg.id, tid, "grp")  # keyed on trigger msg + tid
-    group_key = (msg.chat.id, mgid, tid)
-    lock      = _get_target_lock(tid)
+    """Copy a whole media group to one target with persistent retries."""
+    mgid = str(msg.media_group_id)
+    group_key = (msg.chat.id, mgid, tid, "album")
+    lock = _get_target_lock(tid)
 
     async with lock:
-        if group_key in _msg_dedup or dedup_key in _msg_dedup:
-            logger.debug(
-                f"[af_engine]{label} album dedup hit → {tid} group {mgid}"
-            )
+        if group_key in _album_dedup:
+            logger.debug(f"[af_engine]{label} album dedup hit → {tid} group {mgid}")
             return True
 
         attempt = 0
@@ -248,60 +266,61 @@ async def _copy_album(
             attempt += 1
             try:
                 await client.copy_media_group(
-                    chat_id      = tid,
-                    from_chat_id = msg.chat.id,
-                    message_id   = msg.id,
+                    chat_id=tid,
+                    from_chat_id=msg.chat.id,
+                    message_id=msg.id,
                 )
-                _remember(_msg_dedup, group_key)
-                _remember(_msg_dedup, dedup_key)
+                _remember(_album_dedup, group_key)
                 await asyncio.sleep(inter_delay)
                 return True
 
             except FloodWait as e:
                 wait = int(e.value) + 2
                 logger.warning(
-                    f"[af_engine]{label} FloodWait {e.value}s (album) → {tid} "
-                    f"group {mgid} (attempt {attempt}), sleeping {wait}s…"
+                    f"[af_engine]{label} FloodWait {e.value}s album → {tid} "
+                    f"group {mgid} attempt {attempt}; sleeping {wait}s"
                 )
                 await asyncio.sleep(wait)
 
             except Exception as e:
-                logger.error(
-                    f"[af_engine]{label} copy_media_group failed → {tid} "
-                    f"group {mgid} (attempt {attempt}/{_ERROR_RETRY_MAX}): {e}"
-                )
-                if attempt >= _ERROR_RETRY_MAX:
+                if _is_fatal_copy_error(e):
                     logger.critical(
-                        f"[af_engine]{label} PERMANENT ALBUM FAIL → {tid} "
+                        f"[af_engine]{label} fatal album failure → {tid} "
                         f"group {mgid}: {e}"
                     )
                     return False
-                await asyncio.sleep(min(2 ** attempt, 60))
+
+                wait = min(2 ** min(attempt, 6), 60)
+                logger.error(
+                    f"[af_engine]{label} transient album failure → {tid} "
+                    f"group {mgid} attempt {attempt}: {e}; retrying in {wait}s"
+                )
+                await asyncio.sleep(wait)
 
 
 async def _forward_to_targets(
-    client:     Client,
+    client: Client,
     msg,
     target_ids: list,
-    speed:      str,
-    label:      str = "",
+    speed: str,
+    label: str = "",
 ):
-    """Forward one message (or its whole album) to every target."""
-    delay    = SPEED_DELAY.get(speed, SPEED_DELAY[AF_DEFAULT_SPEED])
+    """Forward one message/album to every target independently."""
+    delay = SPEED_DELAY.get(speed, SPEED_DELAY[AF_DEFAULT_SPEED])
     is_album = bool(getattr(msg, "media_group_id", None))
-    for tid in target_ids:
-        try:
-            if is_album:
-                await _copy_album(client, tid, msg, delay, label)
-            else:
-                await _copy_single(client, tid, msg, delay, label)
-        except Exception as e:
-            # Should not happen — inner helpers swallow their own errors —
-            # but guard anyway so one bad target never blocks the others.
-            logger.error(
-                f"[af_engine]{label} unexpected forward error → {tid}: {e}",
-                exc_info=True,
-            )
+
+    tasks = []
+    for tid in list(dict.fromkeys(int(t) for t in target_ids)):
+        if is_album:
+            tasks.append(asyncio.create_task(_copy_album(client, tid, msg, delay, label)))
+        else:
+            tasks.append(asyncio.create_task(_copy_single(client, tid, msg, delay, label)))
+
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"[af_engine]{label} target task error: {result}", exc_info=True)
 
 
 # ── Startup helpers ───────────────────────────────────────────────────────────
@@ -309,16 +328,13 @@ async def _forward_to_targets(
 async def start_af_queue(bot_client: Client):
     """No-op kept for import compatibility with main.py."""
     logger.info(
-        "[af_engine] direct-forward mode active "
-        "(dedup + unlimited FloodWait retry + album-aware)"
+        "[af_engine] reliable direct-forward mode active "
+        "(all sources → all targets, unlimited transient retries)"
     )
 
 
 async def start_all_userbot_af():
-    """
-    At bot startup: for every user with AF sources+targets and a saved
-    userbot session, start one Pyrogram client to monitor their channels.
-    """
+    """Start userbot AF clients for saved sessions at boot."""
     configs = await db.get_all_af_configs()
     started = 0
     for cfg in configs:
@@ -332,80 +348,70 @@ async def start_all_userbot_af():
             await start_userbot_af(uid, ub_data["session"])
             started += 1
         except Exception as e:
-            logger.error(f"[af_engine] Could not start userbot for {uid}: {e}")
+            logger.error(f"[af_engine] could not start userbot for {uid}: {e}", exc_info=True)
     logger.info(f"[af_engine] {started} userbot AF client(s) started at boot")
 
 
 async def start_userbot_af(user_id: int, session_string: str) -> None:
-    """Start (or restart) the userbot Pyrogram client for user_id."""
+    """Start or restart the userbot listener for one owner."""
     await stop_userbot_af(user_id)
 
     ub = Client(
         f"af_ub_{user_id}",
-        api_id         = Config.API_ID,
-        api_hash       = Config.API_HASH,
-        session_string = session_string,
-        in_memory      = True,
+        api_id=Config.API_ID,
+        api_hash=Config.API_HASH,
+        session_string=session_string,
+        in_memory=True,
     )
 
     async def _handler(ub_client: Client, message):
         try:
             source_id = message.chat.id
-            cfg       = await db.get_af_config(user_id)
+            cfg = await db.get_af_config(user_id)
 
-            if not any(s["id"] == source_id for s in cfg.get("sources", [])):
+            if not any(int(s["id"]) == int(source_id) for s in cfg.get("sources", [])):
                 return
 
-            target_ids = [t["id"] for t in cfg.get("targets", [])]
+            target_ids = [int(t["id"]) for t in cfg.get("targets", [])]
             if not target_ids:
                 return
 
             if not _passes_af_filter(message, cfg):
-                logger.debug(
-                    f"[af_engine] ub: msg {message.id} filtered out for {user_id}"
-                )
+                logger.debug(f"[af_engine] ub: msg {message.id} filtered out for {user_id}")
                 return
 
-            # Album coalescing — do the check-and-set atomically (no awaits).
             mgid = getattr(message, "media_group_id", None)
-            if mgid:
-                gkey = (source_id, str(mgid), user_id)
-                if gkey in _group_seen:
-                    return
-                _remember(_group_seen, gkey)
-
             speed = cfg.get("speed", AF_DEFAULT_SPEED)
             logger.info(
-                f"[af_engine] ub: forwarding {'album ' if mgid else ''}"
-                f"msg {message.id} from {source_id} → {target_ids} "
-                f"[speed={speed}]"
+                f"[af_engine] ub: queuing {'album ' if mgid else ''}"
+                f"msg {message.id} from {source_id} → {target_ids} [speed={speed}]"
             )
-            # Dispatch as a task so the handler returns immediately and the
-            # next incoming update is never blocked waiting for a long retry.
-            asyncio.create_task(
+
+            task = asyncio.create_task(
                 _forward_to_targets(
-                    ub_client, message, target_ids, speed,
+                    ub_client,
+                    message,
+                    target_ids,
+                    speed,
                     label=f" [ub:{user_id}]",
                 )
             )
-        except Exception as e:
-            logger.error(
-                f"[af_engine] userbot handler error (uid {user_id}): {e}",
-                exc_info=True,
-            )
+            _track_task(task, f" [ub:{user_id}] msg {message.id}")
 
-    ub.add_handler(MessageHandler(_handler, filters.channel & _MEDIA))
+        except Exception as e:
+            logger.error(f"[af_engine] userbot handler error uid {user_id}: {e}", exc_info=True)
+
+    ub.add_handler(MessageHandler(_handler, _SOURCE_MESSAGES))
     await ub.start()
     me = await ub.get_me()
     _running_userbots[user_id] = ub
     logger.info(
-        f"[af_engine] userbot AF ready — user {user_id}, "
-        f"account @{me.username or me.id}"
+        f"[af_engine] userbot AF ready — user {user_id}, account @{me.username or me.id}"
     )
 
 
 async def stop_userbot_af(user_id: int) -> None:
-    """Stop and remove the userbot client for user_id (if running)."""
+    """Stop and remove the userbot client for user_id if running."""
     ub = _running_userbots.pop(user_id, None)
     if ub:
         try:
@@ -415,51 +421,41 @@ async def stop_userbot_af(user_id: int) -> None:
         logger.info(f"[af_engine] userbot AF stopped — user {user_id}")
 
 
-# ── Bot-side channel handler ──────────────────────────────────────────────────
-# Skipped for any user whose userbot is already handling the same source.
+# ── Bot-side source handler ───────────────────────────────────────────────────
 
-@Client.on_message(filters.channel & _MEDIA)
+@Client.on_message(_SOURCE_MESSAGES)
 async def _bot_channel_handler(bot_client: Client, message):
     try:
-        source_id    = message.chat.id
+        source_id = message.chat.id
         user_entries = await db.get_source_users(source_id)
         if not user_entries:
             return
 
         mgid = getattr(message, "media_group_id", None)
-
         for uid, tids, cfg in user_entries:
-            # Skip — userbot is already watching for this user
-            if uid in _running_userbots:
-                continue
-
+            # Do not skip when a userbot exists.  If either listener succeeds,
+            # post-send dedup prevents duplicates; if one listener cannot access
+            # a source/target, the other can still deliver the file.
             if not _passes_af_filter(message, cfg):
-                logger.debug(
-                    f"[af_engine] bot: msg {message.id} filtered out for {uid}"
-                )
+                logger.debug(f"[af_engine] bot: msg {message.id} filtered out for {uid}")
                 continue
-
-            # Album coalescing per (source, group, user) — atomic sync block.
-            if mgid:
-                gkey = (source_id, str(mgid), uid)
-                if gkey in _group_seen:
-                    continue
-                _remember(_group_seen, gkey)
 
             speed = cfg.get("speed", AF_DEFAULT_SPEED)
             logger.info(
                 f"[af_engine] bot: queuing {'album ' if mgid else ''}"
                 f"msg {message.id} from {source_id} → {tids} [speed={speed}]"
             )
-            # Fire-and-forget so bursty updates don't block the dispatcher.
-            # Each user's forward runs concurrently; per-target locks inside
-            # _copy_single / _copy_album serialise sends to any one target.
-            asyncio.create_task(
+
+            task = asyncio.create_task(
                 _forward_to_targets(
-                    bot_client, message, tids, speed,
+                    bot_client,
+                    message,
+                    tids,
+                    speed,
                     label=f" [bot→{uid}]",
                 )
             )
+            _track_task(task, f" [bot→{uid}] msg {message.id}")
 
     except Exception as e:
         logger.error(f"[af_engine] bot handler error: {e}", exc_info=True)

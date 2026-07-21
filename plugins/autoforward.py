@@ -64,6 +64,8 @@ TYPE_META = [
     ("audio",     "🎵 Audio"),
     ("voice",     "🎤 Voice"),
     ("animation", "🎭 Anim"),
+    ("video_note", "📹 VNote"),
+    ("sticker",   "🏷 Sticker"),
 ]
 
 
@@ -125,11 +127,13 @@ def _filters_kb(f: dict):
     exts   = f.get("extensions",  [])
 
     row_types_1 = [_type_btn(k, l) for k, l in TYPE_META[:3]]
-    row_types_2 = [_type_btn(k, l) for k, l in TYPE_META[3:]]
+    row_types_2 = [_type_btn(k, l) for k, l in TYPE_META[3:6]]
+    row_types_3 = [_type_btn(k, l) for k, l in TYPE_META[6:]]
 
     return InlineKeyboardMarkup([
         row_types_1,
         row_types_2,
+        row_types_3,
         [
             InlineKeyboardButton(
                 f"📏 Min: {min_mb} MB" if min_mb else "📏 Min Size: Off",
@@ -533,6 +537,7 @@ async def af_conversation(client, message: Message):
                         InlineKeyboardButton("➕ Add Another", callback_data="af:addsrc"),
                     ]]),
                 )
+                await _ensure_userbot_running(uid)
         else:
             result = await db.add_af_target(uid, chat_id, chat_title)
             af_states.pop(uid, None)
@@ -552,6 +557,7 @@ async def af_conversation(client, message: Message):
                         InlineKeyboardButton("➕ Add Another", callback_data="af:addtgt"),
                     ]]),
                 )
+                await _ensure_userbot_running(uid)
 
     # ── Filter: min size ──────────────────────────────────────────────────────
     elif step == "waiting_min_size":
@@ -815,6 +821,24 @@ async def _finish_userbot_login(bot_client, message, uid, phone_client):
             InlineKeyboardButton("🔙 Back to Menu", callback_data="af:menu")
         ]]),
     )
+
+
+async def _ensure_userbot_running(uid: int):
+    """Start saved userbot listener after sources/targets are added."""
+    from plugins.af_engine import _running_userbots, start_userbot_af
+
+    if uid in _running_userbots:
+        return
+    cfg = await db.get_af_config(uid)
+    if not cfg.get("sources") or not cfg.get("targets"):
+        return
+    ub = await db.get_userbot(uid)
+    if not ub or not ub.get("session"):
+        return
+    try:
+        await start_userbot_af(uid, ub["session"])
+    except Exception as e:
+        logger.error(f"[autoforward] Failed to start userbot AF for {uid}: {e}")
 
 
 async def _show_userbot_panel(query: CallbackQuery, uid: int):
