@@ -53,12 +53,12 @@ _SOURCE_MESSAGES = (filters.channel | filters.group) & _MEDIA
 
 # ── Inter-message delay inside the per-target lock ────────────────────────────
 
-_MIN_DELAY = 0.5
+_MIN_DELAY = 0.0
 
 SPEED_DELAY: dict = {
-    "safe": 3.0,
-    "normal": 1.0,
-    "fast": _MIN_DELAY,
+    "safe": 0.0,
+    "normal": 0.0,
+    "fast": 0.0,
 }
 
 
@@ -158,12 +158,6 @@ _FATAL_COPY_ERRORS = (
     "CHAT_WRITE_FORBIDDEN",
     "USER_BANNED_IN_CHANNEL",
     "CHANNEL_PRIVATE",
-    "PEER_ID_INVALID",
-    "MESSAGE_ID_INVALID",
-    "MSG_ID_INVALID",
-    "MESSAGE_EMPTY",
-    "MEDIA_EMPTY",
-    "FILE_REFERENCE_EMPTY",
     "BOT_METHOD_INVALID",
 )
 
@@ -193,7 +187,7 @@ async def _copy_single(
     client: Client,
     tid: int,
     msg,
-    inter_delay: float,
+    
     label: str,
 ) -> bool:
     """Copy one non-album message to one target with persistent retries."""
@@ -217,7 +211,6 @@ async def _copy_single(
                     caption_entities=msg.caption_entities if msg.caption else None,
                 )
                 _remember(_msg_dedup, dedup_key)
-                await asyncio.sleep(inter_delay)
                 return True
 
             except FloodWait as e:
@@ -248,7 +241,7 @@ async def _copy_album(
     client: Client,
     tid: int,
     msg,
-    inter_delay: float,
+    
     label: str,
 ) -> bool:
     """Copy a whole media group to one target with persistent retries."""
@@ -271,7 +264,6 @@ async def _copy_album(
                     message_id=msg.id,
                 )
                 _remember(_album_dedup, group_key)
-                await asyncio.sleep(inter_delay)
                 return True
 
             except FloodWait as e:
@@ -312,9 +304,9 @@ async def _forward_to_targets(
     tasks = []
     for tid in list(dict.fromkeys(int(t) for t in target_ids)):
         if is_album:
-            tasks.append(asyncio.create_task(_copy_album(client, tid, msg, delay, label)))
+            tasks.append(asyncio.create_task(_copy_album(client, tid, msg, label)))
         else:
-            tasks.append(asyncio.create_task(_copy_single(client, tid, msg, delay, label)))
+            tasks.append(asyncio.create_task(_copy_single(client, tid, msg, label)))
 
     if tasks:
         results = await asyncio.gather(*tasks, return_exceptions=True)

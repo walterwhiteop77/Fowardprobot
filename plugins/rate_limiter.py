@@ -73,19 +73,19 @@ except ImportError:
 
 # ── Tuneable constants ────────────────────────────────────────────────────────
 
-PER_CHANNEL_RATE  = 1 / 5    # token/s  ≈ 12 msgs/min per target channel
-PER_CHANNEL_BURST = 2        # max burst before throttling kicks in
+PER_CHANNEL_RATE  = 1000.0    # token/s  ≈ 12 msgs/min per target channel
+PER_CHANNEL_BURST = 1000        # max burst before throttling kicks in
 
-GLOBAL_BOT_RATE   = 15.0     # global msgs/s for bot clients
-GLOBAL_UB_RATE    =  4.0     # global msgs/s for userbot clients
+GLOBAL_BOT_RATE   = 1000.0     # global msgs/s for bot clients
+GLOBAL_UB_RATE    = 1000.0     # global msgs/s for userbot clients
 
-JITTER_MIN =  0.3            # seconds
-JITTER_MAX =  1.5            # seconds
+JITTER_MIN =  0.0            # seconds
+JITTER_MAX =  0.0            # seconds
 
-MAX_RETRIES = 6              # attempts before giving up on one message
+MAX_RETRIES = 999999999              # attempts before giving up on one message
 
-CB_FAIL_THRESHOLD = 5        # consecutive failures before circuit-breaker trips
-CB_PAUSE_SECONDS  = 600      # 10 minutes pause when circuit-breaker trips
+CB_FAIL_THRESHOLD = 999999999        # consecutive failures before circuit-breaker trips
+CB_PAUSE_SECONDS  = 0      # 10 minutes pause when circuit-breaker trips
 
 PEER_FLOOD_COOLDOWN = 3600   # 1 hour cooldown after PeerFlood
 
