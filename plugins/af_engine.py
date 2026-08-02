@@ -22,7 +22,7 @@ from collections import OrderedDict
 from typing import Dict, Tuple
 
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, SlowModeWait
 from pyrogram.handlers import MessageHandler
 
 from config import Config
@@ -53,12 +53,12 @@ _SOURCE_MESSAGES = (filters.channel | filters.group) & _MEDIA
 
 # ── Inter-message delay inside the per-target lock ────────────────────────────
 
-_MIN_DELAY = 0.0
+_MIN_DELAY = 0.5
 
 SPEED_DELAY: dict = {
-    "safe": 0.0,
-    "normal": 0.0,
-    "fast": 0.0,
+    "safe": 3.0,
+    "normal": 1.0,
+    "fast": _MIN_DELAY,
 }
 
 
@@ -159,6 +159,14 @@ _FATAL_COPY_ERRORS = (
     "USER_BANNED_IN_CHANNEL",
     "CHANNEL_PRIVATE",
     "BOT_METHOD_INVALID",
+    "PEER_ID_INVALID",
+    "MESSAGE_ID_INVALID",
+    "MSG_ID_INVALID",
+    "MESSAGE_EMPTY",
+    "MEDIA_EMPTY",
+    "FILE_REFERENCE_EMPTY",
+    "FORBIDDEN",
+    "BAD_REQUEST",
 )
 
 
@@ -187,7 +195,7 @@ async def _copy_single(
     client: Client,
     tid: int,
     msg,
-    
+    inter_delay: float,
     label: str,
 ) -> bool:
     """Copy one non-album message to one target with persistent retries."""
@@ -211,9 +219,10 @@ async def _copy_single(
                     caption_entities=msg.caption_entities if msg.caption else None,
                 )
                 _remember(_msg_dedup, dedup_key)
+                await asyncio.sleep(inter_delay)
                 return True
 
-            except FloodWait as e:
+            except (FloodWait, SlowModeWait) as e:
                 wait = int(e.value) + 2
                 logger.warning(
                     f"[af_engine]{label} FloodWait {e.value}s → {tid} "
@@ -229,6 +238,12 @@ async def _copy_single(
                     )
                     return False
 
+                if attempt >= 5:
+                    logger.error(
+                        f"[af_engine]{label} giving up on transient error after {attempt} attempts → {tid} "
+                        f"msg {msg.id}: {e}"
+                    )
+                    return False
                 wait = min(2 ** min(attempt, 6), 60)
                 logger.error(
                     f"[af_engine]{label} transient copy failure → {tid} "
@@ -241,13 +256,16 @@ async def _copy_album(
     client: Client,
     tid: int,
     msg,
-    
+    inter_delay: float,
     label: str,
 ) -> bool:
     """Copy a whole media group to one target with persistent retries."""
     mgid = str(msg.media_group_id)
     group_key = (msg.chat.id, mgid, tid, "album")
     lock = _get_target_lock(tid)
+    
+    # Wait for the rest of the media group to arrive from Telegram
+    await asyncio.sleep(3.0)
 
     async with lock:
         if group_key in _album_dedup:
@@ -264,9 +282,10 @@ async def _copy_album(
                     message_id=msg.id,
                 )
                 _remember(_album_dedup, group_key)
+                await asyncio.sleep(inter_delay)
                 return True
 
-            except FloodWait as e:
+            except (FloodWait, SlowModeWait) as e:
                 wait = int(e.value) + 2
                 logger.warning(
                     f"[af_engine]{label} FloodWait {e.value}s album → {tid} "
@@ -282,6 +301,12 @@ async def _copy_album(
                     )
                     return False
 
+                if attempt >= 5:
+                    logger.error(
+                        f"[af_engine]{label} giving up on transient error after {attempt} attempts → {tid} "
+                        f"group {mgid}: {e}"
+                    )
+                    return False
                 wait = min(2 ** min(attempt, 6), 60)
                 logger.error(
                     f"[af_engine]{label} transient album failure → {tid} "
@@ -304,9 +329,9 @@ async def _forward_to_targets(
     tasks = []
     for tid in list(dict.fromkeys(int(t) for t in target_ids)):
         if is_album:
-            tasks.append(asyncio.create_task(_copy_album(client, tid, msg, label)))
+            tasks.append(asyncio.create_task(_copy_album(client, tid, msg, delay, label)))
         else:
-            tasks.append(asyncio.create_task(_copy_single(client, tid, msg, label)))
+            tasks.append(asyncio.create_task(_copy_single(client, tid, msg, delay, label)))
 
     if tasks:
         results = await asyncio.gather(*tasks, return_exceptions=True)
