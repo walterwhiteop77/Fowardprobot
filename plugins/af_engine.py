@@ -66,6 +66,12 @@ SPEED_DELAY: dict = {
 
 _running_userbots: Dict[int, Client] = {}
 
+# Keep strong references to fire-and-forget delivery tasks until they finish.
+# asyncio only keeps weak references to tasks; without this registry a busy
+# event loop can garbage-collect a suspended task and silently lose a
+# forwarding operation.
+_background_tasks: set[asyncio.Task] = set()
+
 
 # ── Per-target send locks ─────────────────────────────────────────────────────
 
@@ -178,7 +184,10 @@ def _is_fatal_copy_error(exc: Exception) -> bool:
 def _track_task(task: asyncio.Task, label: str) -> None:
     """Make background task failures visible in bot.log/stdout."""
 
+    _background_tasks.add(task)
+
     def _done(done: asyncio.Task):
+        _background_tasks.discard(done)
         try:
             done.result()
         except asyncio.CancelledError:
@@ -238,10 +247,15 @@ async def _copy_single(
                     )
                     return False
 
-                if attempt >= 5:
+                # Do not permanently drop a message because of a temporary
+                # Telegram/network failure.  The old five-attempt limit is
+                # easy to hit when several sources feed the same target or
+                # Telegram is throttling the account.
+                if isinstance(e, (TypeError, ValueError, AttributeError, KeyError)):
                     logger.error(
-                        f"[af_engine]{label} giving up on transient error after {attempt} attempts → {tid} "
-                        f"msg {msg.id}: {e}"
+                        f"[af_engine]{label} non-retryable local error → {tid} "
+                        f"msg {msg.id}: {e}",
+                        exc_info=True,
                     )
                     return False
                 wait = min(2 ** min(attempt, 6), 60)
@@ -301,10 +315,11 @@ async def _copy_album(
                     )
                     return False
 
-                if attempt >= 5:
+                if isinstance(e, (TypeError, ValueError, AttributeError, KeyError)):
                     logger.error(
-                        f"[af_engine]{label} giving up on transient error after {attempt} attempts → {tid} "
-                        f"group {mgid}: {e}"
+                        f"[af_engine]{label} non-retryable local error → {tid} "
+                        f"group {mgid}: {e}",
+                        exc_info=True,
                     )
                     return False
                 wait = min(2 ** min(attempt, 6), 60)
@@ -393,6 +408,11 @@ async def start_userbot_af(user_id: int, session_string: str) -> None:
             if not target_ids:
                 return
 
+            logger.info(
+                f"[af_engine] userbot source matched — user={user_id}, "
+                f"chat={source_id}, msg={message.id}, targets={target_ids}"
+            )
+
             if not _passes_af_filter(message, cfg):
                 logger.debug(f"[af_engine] ub: msg {message.id} filtered out for {user_id}")
                 return
@@ -449,6 +469,10 @@ async def _bot_channel_handler(bot_client: Client, message):
             return
 
         mgid = getattr(message, "media_group_id", None)
+        logger.info(
+            f"[af_engine] source matched — chat={source_id}, msg={message.id}, "
+            f"users={len(user_entries)}, album={bool(mgid)}"
+        )
         for uid, tids, cfg in user_entries:
             # Do not skip when a userbot exists.  If either listener succeeds,
             # post-send dedup prevents duplicates; if one listener cannot access
